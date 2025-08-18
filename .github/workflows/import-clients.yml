@@ -1,0 +1,223 @@
+name: Import Clients from CSV
+on:
+  workflow_dispatch:
+    inputs:
+      csv_path:
+        description: Path to CSV in repo
+        required: true
+        default: data/client_directory_import_onlyValues.csv
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    env:
+      DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install psql
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Ensure staging exists
+        run: |
+          psql "$DB_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          create table if not exists public.clients_staging (
+            client_code text,
+            client_id bigint,
+            client_name text,
+            client_email text,
+            client_company_name text,
+            client_website text,
+            assigned_account_manager text,
+            assigned_inbox_manager text,
+            relationship_status text,
+            onboarding_activated text,
+            onboarding_date text,
+            recurring_cost_usd text,
+            weekend_sending text,
+            relationship_type text,
+            booking_link text,
+            phone_number text,
+            avg_dollar_gen_pm text,
+            exit_date text
+          );
+          SQL
+
+      - name: Truncate staging
+        run: psql "$DB_URL" -v ON_ERROR_STOP=1 -c "truncate table public.clients_staging;"
+
+      - name: Load CSV to staging
+        run: psql "$DB_URL" -v ON_ERROR_STOP=1 -c "\copy public.clients_staging from '${{ github.workspace }}/${{ github.event.inputs.csv_path }}' with (format csv, header true)"
+
+      - name: Merge into main tables
+        run: |
+          psql "$DB_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          -- Helpers needed for merge and later audits
+          create or replace function public.to_bool(x text) returns boolean language plpgsql immutable as $$
+          begin
+            if x is null then return null; end if;
+            if lower(trim(x)) in ('1','true','yes','y') then return true; end if;
+            if lower(trim(x)) in ('0','false','no','n') then return false; end if;
+            return null;
+          end $$;
+
+          -- Lookups
+          create table if not exists public.relationship_statuses (name text primary key);
+          create table if not exists public.relationship_types (name text primary key);
+
+          insert into public.relationship_statuses(name)
+          select distinct upper(trim(relationship_status))
+          from public.clients_staging
+          where relationship_status is not null and trim(relationship_status) <> ''
+          on conflict do nothing;
+
+          insert into public.relationship_types(name)
+          select distinct upper(trim(relationship_type))
+          from public.clients_staging
+          where relationship_type is not null and trim(relationship_type) <> ''
+          on conflict do nothing;
+
+          -- Team members
+          create extension if not exists "uuid-ossp";
+          create table if not exists public.team_members (
+            id uuid primary key default gen_random_uuid(),
+            full_name text not null,
+            email text not null unique,
+            role text check (role in ('account_manager','inbox_manager','other')) default 'other',
+            created_at timestamptz not null default now()
+          );
+
+          -- Parse manager emails and seed team members
+          with parsed as (
+            select
+              nullif(regexp_replace(assigned_account_manager, '.*<(.*)>', '\1'), '') as am_email_raw,
+              nullif(regexp_replace(assigned_inbox_manager, '.*<(.*)>', '\1'), '') as im_email_raw,
+              assigned_account_manager, assigned_inbox_manager
+            from public.clients_staging
+          )
+          insert into public.team_members(full_name, email, role)
+          select distinct
+            coalesce(split_part(s.assigned_account_manager, ' <', 1), split_part(p.am_email_raw, '@', 1)),
+            lower(coalesce(p.am_email_raw, s.assigned_account_manager)),
+            'account_manager'
+          from public.clients_staging s
+          join parsed p on true
+          where s.assigned_account_manager is not null
+            and coalesce(p.am_email_raw, s.assigned_account_manager) ~* '^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$'
+          on conflict (email) do nothing;
+
+          with parsed as (
+            select
+              nullif(regexp_replace(assigned_inbox_manager, '.*<(.*)>', '\1'), '') as im_email_raw,
+              assigned_inbox_manager
+            from public.clients_staging
+          )
+          insert into public.team_members(full_name, email, role)
+          select distinct
+            coalesce(split_part(s.assigned_inbox_manager, ' <', 1), split_part(p.im_email_raw, '@', 1)),
+            lower(coalesce(p.im_email_raw, s.assigned_inbox_manager)),
+            'inbox_manager'
+          from public.clients_staging s
+          join parsed p on true
+          where s.assigned_inbox_manager is not null
+            and coalesce(p.im_email_raw, s.assigned_inbox_manager) ~* '^[A-Z0-9._%+-]+@[A-Z]{2,}$'
+          on conflict (email) do nothing;
+
+          -- Main tables if not exist
+          create table if not exists public.clients (
+            client_code text not null,
+            client_id bigint not null,
+            client_name text not null,
+            client_email text unique,
+            client_company_name text,
+            client_website text unique,
+            relationship_status text not null references public.relationship_statuses(name) on update cascade,
+            relationship_type text references public.relationship_types(name) on update cascade,
+            onboarding_activated boolean not null default false,
+            onboarding_date date,
+            recurring_cost_usd numeric(12,2),
+            weekend_sending_mode text not null default 'inherit' check (weekend_sending_mode in ('inherit','true','false')),
+            weekend_sending_effective boolean generated always as (
+              case weekend_sending_mode when 'inherit' then true when 'true' then true else false end
+            ) stored,
+            booking_link text,
+            phone_number text,
+            avg_dollar_gen_pm numeric(12,2),
+            exit_date date,
+            assigned_account_manager_id uuid references public.team_members(id) on delete set null,
+            assigned_inbox_manager_id uuid references public.team_members(id) on delete set null,
+            created_at timestamptz not null default now(),
+            updated_at timestamptz not null default now(),
+            primary key (client_code, client_id)
+          );
+
+          -- Upsert clients from staging
+          insert into public.clients(
+            client_code, client_id, client_name, client_email, client_company_name,
+            client_website, relationship_status, relationship_type, onboarding_activated,
+            onboarding_date, recurring_cost_usd, weekend_sending_mode, booking_link,
+            phone_number, avg_dollar_gen_pm, exit_date,
+            assigned_account_manager_id, assigned_inbox_manager_id
+          )
+          select
+            trim(client_code),
+            client_id::bigint,
+            trim(client_name),
+            nullif(trim(client_email), ''),
+            nullif(trim(client_company_name), ''),
+            nullif(trim(client_website), ''),
+            upper(nullif(trim(relationship_status), '')),
+            case when trim(coalesce(relationship_type, '')) = '' then null else upper(trim(relationship_type)) end,
+            coalesce(public.to_bool(onboarding_activated), false),
+            case when nullif(trim(onboarding_date), '') is null then null else to_date(trim(onboarding_date), 'YYYY-MM-DD') end,
+            nullif(trim(recurring_cost_usd), '')::numeric,
+            case
+              when public.to_bool(weekend_sending) is null then 'inherit'
+              when public.to_bool(weekend_sending) = true then 'true'
+              else 'false'
+            end,
+            nullif(trim(booking_link), ''),
+            nullif(trim(phone_number), ''),
+            nullif(trim(avg_dollar_gen_pm), '')::numeric,
+            case when nullif(trim(exit_date), '') is null then null else to_date(trim(exit_date), 'YYYY-MM-DD') end,
+            (
+              select id from public.team_members tm
+              where tm.email = lower(coalesce(nullif(regexp_replace(clients_staging.assigned_account_manager, '.*<(.*)>', '\1'), ''), clients_staging.assigned_account_manager))
+              limit 1
+            ),
+            (
+              select id from public.team_members tm
+              where tm.email = lower(coalesce(nullif(regexp_replace(clients_staging.assigned_inbox_manager, '.*<(.*)>', '\1'), ''), clients_staging.assigned_inbox_manager))
+              limit 1
+            )
+          from public.clients_staging
+          where trim(client_code) <> '' and client_id is not null
+          on conflict (client_code, client_id) do update set
+            client_name = excluded.client_name,
+            client_email = excluded.client_email,
+            client_company_name = excluded.client_company_name,
+            client_website = excluded.client_website,
+            relationship_status = excluded.relationship_status,
+            relationship_type = excluded.relationship_type,
+            onboarding_activated = excluded.onboarding_activated,
+            onboarding_date = excluded.onboarding_date,
+            recurring_cost_usd = excluded.recurring_cost_usd,
+            weekend_sending_mode = excluded.weekend_sending_mode,
+            booking_link = excluded.booking_link,
+            phone_number = excluded.phone_number,
+            avg_dollar_gen_pm = excluded.avg_dollar_gen_pm,
+            exit_date = excluded.exit_date,
+            assigned_account_manager_id = excluded.assigned_account_manager_id,
+            assigned_inbox_manager_id = excluded.assigned_inbox_manager_id;
+          SQL
+
+      - name: Summary checks
+        run: |
+          echo "Row count by status:"
+          psql "$DB_URL" -c "select relationship_status, count(*) from public.clients group by 1 order by 1;"
+          echo "Row count by type:"
+          psql "$DB_URL" -c "select coalesce(relationship_type,'(NULL)') as relationship_type, count(*) from public.clients group by 1 order by 1;"
+          echo "Total clients:"
+          psql "$DB_URL" -c "select count(*) from public.clients;"
+          echo "Sample:"
+          psql "$DB_URL" -c "select client_code, client_id, client_name, weekend_sending_mode, weekend_sending_effective from public.clients order by created_at desc limit 10;"
