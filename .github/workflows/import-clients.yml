@@ -1,24 +1,29 @@
 name: Import Clients from CSV
+
 on:
   workflow_dispatch:
     inputs:
       csv_path:
         description: Path to CSV in repo
         required: true
-        default: data/client_directory_import_onlyValues.csv
+        default: data/client_directory_cleaned.csv
 
 jobs:
   import:
     runs-on: ubuntu-latest
     env:
       DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Install psql
-        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+          psql --version
 
-      - name: Ensure staging exists
+      - name: Ensure staging table exists
         run: |
           psql "$DB_URL" -v ON_ERROR_STOP=1 <<'SQL'
           create table if not exists public.clients_staging (
@@ -46,19 +51,37 @@ jobs:
       - name: Truncate staging
         run: psql "$DB_URL" -v ON_ERROR_STOP=1 -c "truncate table public.clients_staging;"
 
-      - name: Load CSV to staging
-        run: psql "$DB_URL" -v ON_ERROR_STOP=1 -c "\copy public.clients_staging from '${{ github.workspace }}/${{ github.event.inputs.csv_path }}' with (format csv, header true)"
+      - name: Load CSV into staging
+        run: |
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -c "\copy public.clients_staging from '${{ github.workspace }}/${{ github.event.inputs.csv_path }}' with (format csv, header true)"
 
-      - name: Merge into main tables
+      - name: Merge into main tables with normalization and safe uniqueness
         run: |
           psql "$DB_URL" -v ON_ERROR_STOP=1 <<'SQL'
-          -- Helpers needed for merge and later audits
-          create or replace function public.to_bool(x text) returns boolean language plpgsql immutable as $$
+          -- Helpers
+          create extension if not exists "uuid-ossp";
+
+          create or replace function public.to_bool(x text) returns boolean
+          language plpgsql immutable as $$
           begin
             if x is null then return null; end if;
             if lower(trim(x)) in ('1','true','yes','y') then return true; end if;
             if lower(trim(x)) in ('0','false','no','n') then return false; end if;
             return null;
+          end $$;
+
+          -- Normalizer returns NULL for junk values and ensures scheme
+          create or replace function public.normalize_url(u text) returns text
+          language plpgsql immutable as $$
+          declare s text;
+          begin
+            if u is null then return null; end if;
+            s := lower(trim(u));
+            if s = '' or s in ('0','na','n/a','none','null','-') then return null; end if;
+            if s not like 'http://%' and s not like 'https://%' then
+              s := 'https://' || s;
+            end if;
+            return s;
           end $$;
 
           -- Lookups
@@ -78,7 +101,6 @@ jobs:
           on conflict do nothing;
 
           -- Team members
-          create extension if not exists "uuid-ossp";
           create table if not exists public.team_members (
             id uuid primary key default gen_random_uuid(),
             full_name text not null,
@@ -87,7 +109,6 @@ jobs:
             created_at timestamptz not null default now()
           );
 
-          -- Parse manager emails and seed team members
           with parsed as (
             select
               nullif(regexp_replace(assigned_account_manager, '.*<(.*)>', '\1'), '') as am_email_raw,
@@ -106,7 +127,7 @@ jobs:
             and coalesce(p.am_email_raw, s.assigned_account_manager) ~* '^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$'
           on conflict (email) do nothing;
 
-          with parsed as (
+          with parsed2 as (
             select
               nullif(regexp_replace(assigned_inbox_manager, '.*<(.*)>', '\1'), '') as im_email_raw,
               assigned_inbox_manager
@@ -118,27 +139,27 @@ jobs:
             lower(coalesce(p.im_email_raw, s.assigned_inbox_manager)),
             'inbox_manager'
           from public.clients_staging s
-          join parsed p on true
+          join parsed2 p on true
           where s.assigned_inbox_manager is not null
-            and coalesce(p.im_email_raw, s.assigned_inbox_manager) ~* '^[A-Z0-9._%+-]+@[A-Z]{2,}$'
+            and coalesce(p.im_email_raw, s.assigned_inbox_manager) ~* '^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$'
           on conflict (email) do nothing;
 
-          -- Main tables if not exist
+          -- Main table. Only composite PK is required non null per your rule.
           create table if not exists public.clients (
             client_code text not null,
             client_id bigint not null,
-            client_name text not null,
-            client_email text unique,
+            client_name text,
+            client_email text,
             client_company_name text,
-            client_website text unique,
-            relationship_status text not null references public.relationship_statuses(name) on update cascade,
+            client_website text,
+            relationship_status text references public.relationship_statuses(name) on update cascade,
             relationship_type text references public.relationship_types(name) on update cascade,
-            onboarding_activated boolean not null default false,
+            onboarding_activated boolean,
             onboarding_date date,
             recurring_cost_usd numeric(12,2),
-            weekend_sending_mode text not null default 'inherit' check (weekend_sending_mode in ('inherit','true','false')),
+            weekend_sending_mode text check (weekend_sending_mode in ('inherit','true','false')),
             weekend_sending_effective boolean generated always as (
-              case weekend_sending_mode when 'inherit' then true when 'true' then true else false end
+              case weekend_sending_mode when 'inherit' then true when 'true' then true when 'false' then false else null end
             ) stored,
             booking_link text,
             phone_number text,
@@ -151,7 +172,30 @@ jobs:
             primary key (client_code, client_id)
           );
 
-          -- Upsert clients from staging
+          -- Drop unsafe raw unique constraints if they exist
+          alter table public.clients drop constraint if exists clients_client_website_key;
+          alter table public.clients drop constraint if exists clients_client_email_key;
+
+          -- Canonical website for safe uniqueness
+          alter table public.clients
+            add column if not exists website_canonical text generated always as (public.normalize_url(client_website)) stored;
+
+          drop index if exists uq_clients_website_valid;
+          create unique index if not exists uq_clients_website_valid on public.clients(website_canonical)
+          where website_canonical is not null;
+
+          drop index if exists uq_clients_email_valid;
+          create unique index if not exists uq_clients_email_valid on public.clients(lower(client_email))
+          where client_email ~* '^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$';
+
+          -- Updated_at trigger
+          create or replace function public.set_updated_at() returns trigger language plpgsql as $$
+          begin new.updated_at = now(); return new; end $$;
+
+          drop trigger if exists trg_clients_set_updated on public.clients;
+          create trigger trg_clients_set_updated before update on public.clients for each row execute function public.set_updated_at();
+
+          -- Upsert from staging with email and website normalization
           insert into public.clients(
             client_code, client_id, client_name, client_email, client_company_name,
             client_website, relationship_status, relationship_type, onboarding_activated,
@@ -162,13 +206,21 @@ jobs:
           select
             trim(client_code),
             client_id::bigint,
-            trim(client_name),
-            nullif(trim(client_email), ''),
-            nullif(trim(client_company_name), ''),
-            nullif(trim(client_website), ''),
-            upper(nullif(trim(relationship_status), '')),
+            case when trim(coalesce(client_name, '')) = '' then null else trim(client_name) end,
+            case
+              when client_email is null then null
+              when lower(trim(client_email)) in ('0','na','n/a','none','null','-','') then null
+              else trim(client_email)
+            end,
+            case when trim(coalesce(client_company_name, '')) = '' then null else trim(client_company_name) end,
+            case
+              when client_website is null then null
+              when lower(trim(client_website)) in ('0','na','n/a','none','null','-','') then null
+              else trim(client_website)
+            end,
+            case when trim(coalesce(relationship_status, '')) = '' then null else upper(trim(relationship_status)) end,
             case when trim(coalesce(relationship_type, '')) = '' then null else upper(trim(relationship_type)) end,
-            coalesce(public.to_bool(onboarding_activated), false),
+            public.to_bool(onboarding_activated),
             case when nullif(trim(onboarding_date), '') is null then null else to_date(trim(onboarding_date), 'YYYY-MM-DD') end,
             nullif(trim(recurring_cost_usd), '')::numeric,
             case
@@ -176,18 +228,28 @@ jobs:
               when public.to_bool(weekend_sending) = true then 'true'
               else 'false'
             end,
-            nullif(trim(booking_link), ''),
-            nullif(trim(phone_number), ''),
+            case when trim(coalesce(booking_link, '')) = '' then null else trim(booking_link) end,
+            case when trim(coalesce(phone_number, '')) = '' then null else trim(phone_number) end,
             nullif(trim(avg_dollar_gen_pm), '')::numeric,
             case when nullif(trim(exit_date), '') is null then null else to_date(trim(exit_date), 'YYYY-MM-DD') end,
             (
               select id from public.team_members tm
-              where tm.email = lower(coalesce(nullif(regexp_replace(clients_staging.assigned_account_manager, '.*<(.*)>', '\1'), ''), clients_staging.assigned_account_manager))
+              where tm.email = lower(
+                coalesce(
+                  nullif(regexp_replace(clients_staging.assigned_account_manager, '.*<(.*)>', '\1'), ''),
+                  clients_staging.assigned_account_manager
+                )
+              )
               limit 1
             ),
             (
               select id from public.team_members tm
-              where tm.email = lower(coalesce(nullif(regexp_replace(clients_staging.assigned_inbox_manager, '.*<(.*)>', '\1'), ''), clients_staging.assigned_inbox_manager))
+              where tm.email = lower(
+                coalesce(
+                  nullif(regexp_replace(clients_staging.assigned_inbox_manager, '.*<(.*)>', '\1'), ''),
+                  clients_staging.assigned_inbox_manager
+                )
+              )
               limit 1
             )
           from public.clients_staging
@@ -214,10 +276,10 @@ jobs:
       - name: Summary checks
         run: |
           echo "Row count by status:"
-          psql "$DB_URL" -c "select relationship_status, count(*) from public.clients group by 1 order by 1;"
+          psql "$DB_URL" -c "select coalesce(relationship_status,'(NULL)') as relationship_status, count(*) from public.clients group by 1 order by 1;"
           echo "Row count by type:"
           psql "$DB_URL" -c "select coalesce(relationship_type,'(NULL)') as relationship_type, count(*) from public.clients group by 1 order by 1;"
           echo "Total clients:"
           psql "$DB_URL" -c "select count(*) from public.clients;"
           echo "Sample:"
-          psql "$DB_URL" -c "select client_code, client_id, client_name, weekend_sending_mode, weekend_sending_effective from public.clients order by created_at desc limit 10;"
+          psql "$DB_URL" -c "select client_code, client_id, client_name, website_canonical, client_email, weekend_sending_mode, weekend_sending_effective from public.clients order by created_at desc limit 10;"
