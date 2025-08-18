@@ -70,7 +70,6 @@ jobs:
             return null;
           end $$;
 
-          -- Normalizer returns NULL for junk values and ensures scheme
           create or replace function public.normalize_url(u text) returns text
           language plpgsql immutable as $$
           declare s text;
@@ -171,6 +170,15 @@ jobs:
             updated_at timestamptz not null default now(),
             primary key (client_code, client_id)
           );
+
+          -- Ensure past runs did not leave NOT NULL constraints in place
+          do $$
+          begin
+            begin execute 'alter table public.clients alter column client_name drop not null'; exception when others then null; end;
+            begin execute 'alter table public.clients alter column relationship_status drop not null'; exception when others then null; end;
+            begin execute 'alter table public.clients alter column onboarding_activated drop not null'; exception when others then null; end;
+            begin execute 'alter table public.clients alter column weekend_sending_mode drop not null'; exception when others then null; end;
+          end$$;
 
           -- Drop unsafe raw unique constraints if they exist
           alter table public.clients drop constraint if exists clients_client_website_key;
